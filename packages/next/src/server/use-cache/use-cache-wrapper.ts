@@ -58,7 +58,6 @@ import {
   createCookiesForUseCacheStore,
   type UseCacheRenderContext,
 } from '../request/cookies'
-import { clearTimeout } from 'timers'
 
 type CacheKeyParts =
   | [buildId: string, id: string, args: unknown[]]
@@ -232,8 +231,7 @@ async function collectResult(
   outerWorkUnitStore: WorkUnitStore | undefined,
   innerCacheStore: CommonUseCacheStore,
   startTime: number,
-  errors: Array<unknown>, // This is a live array that gets pushed into.,
-  timer: any
+  errors: Array<unknown> // This is a live array that gets pushed into.,
 ): Promise<CacheEntry> {
   // We create a buffered stream that collects all chunks until the end to
   // ensure that RSC has finished rendering and therefore we have collected
@@ -295,6 +293,7 @@ async function collectResult(
     stale: collectedStale,
     tags: collectedTags === null ? [] : collectedTags,
   }
+
   // Propagate tags/revalidate to the parent context.
   propagateCacheLifeAndTags(outerWorkUnitStore, entry)
 
@@ -302,12 +301,9 @@ async function collectResult(
     outerWorkUnitStore && outerWorkUnitStore.type === 'prerender'
       ? outerWorkUnitStore.cacheSignal
       : null
+
   if (cacheSignal) {
     cacheSignal.endRead()
-  }
-
-  if (timer !== undefined) {
-    clearTimeout(timer)
   }
 
   return entry
@@ -377,17 +373,6 @@ async function generateCacheEntryImpl(
 
   let errors: Array<unknown> = []
 
-  let timer = undefined
-  const timeoutAbortController = new AbortController()
-  if (renderContext.type === 'prerender') {
-    // If we're prerendering, we give you 50 seconds to fill a cache entry.
-    // Otherwise we assume you stalled on hanging input and de-opt. This needs
-    // to be lower than just the general timeout of 60 seconds.
-    timer = setTimeout(() => {
-      timeoutAbortController.abort(timeoutError)
-    }, 50000)
-  }
-
   // In the "Cache" environment, we only need to make sure that the error
   // digests are handled correctly. Error formatting and reporting is not
   // necessary here; the errors are encoded in the stream, and will be reported
@@ -406,12 +391,6 @@ async function generateCacheEntryImpl(
       console.error(error)
     }
 
-    if (error === timeoutError) {
-      // The timeout error already aborted the whole stream. We don't need
-      // to also push this error into the `errors` array.
-      return timeoutError.digest
-    }
-
     errors.push(error)
   }
 
@@ -420,29 +399,31 @@ async function generateCacheEntryImpl(
   if (renderContext.type === 'prerender') {
     const { dynamicAccessAbortController, workUnitStore } = renderContext
     const { signal: dynamicAccessAbortSignal } = dynamicAccessAbortController
+    const timeoutAbortController = new AbortController()
 
-    dynamicAccessAbortSignal.addEventListener('abort', () => {
-      clearTimeout(timer)
-    })
+    // If we're prerendering, we give you 50 seconds to fill a cache entry.
+    // Otherwise we assume you stalled on hanging input and de-opt. This needs
+    // to be lower than just the general timeout of 60 seconds.
+    const timer = setTimeout(() => {
+      timeoutAbortController.abort(timeoutError)
+    }, 50000)
+
+    const abortSignal = AbortSignal.any([
+      workUnitStore.renderSignal,
+      dynamicAccessAbortSignal,
+      timeoutAbortController.signal,
+    ])
 
     const { prelude } = await prerender(
       resultPromise,
       clientReferenceManifest.clientModules,
       {
         environmentName: 'Cache',
-        signal: AbortSignal.any([
-          workUnitStore.renderSignal,
-          dynamicAccessAbortSignal,
-          timeoutAbortController.signal,
-        ]),
+        signal: abortSignal,
+        temporaryReferences,
         onError(error) {
-          if (
-            (dynamicAccessAbortSignal.aborted &&
-              dynamicAccessAbortSignal.reason === error) ||
-            (workUnitStore.renderSignal.aborted &&
-              workUnitStore.renderSignal.reason === error)
-          ) {
-            return
+          if (abortSignal.aborted && abortSignal.reason === error) {
+            return error === timeoutError ? timeoutError.digest : undefined
           }
 
           return handleError(error)
@@ -450,10 +431,11 @@ async function generateCacheEntryImpl(
       }
     )
 
-    if (
-      renderContext.type === 'prerender' &&
-      dynamicAccessAbortSignal.aborted
-    ) {
+    clearTimeout(timer)
+
+    if (dynamicAccessAbortSignal.aborted) {
+      workUnitStore.cacheSignal?.endRead()
+
       const hangingPromise = makeHangingPromise<never>(
         workUnitStore.renderSignal,
         dynamicAccessAbortSignal.reason.message
@@ -470,7 +452,6 @@ async function generateCacheEntryImpl(
       clientReferenceManifest.clientModules,
       {
         environmentName: 'Cache',
-        signal: timeoutAbortController.signal,
         temporaryReferences,
         onError: handleError,
       }
@@ -485,8 +466,7 @@ async function generateCacheEntryImpl(
     renderContext.workUnitStore,
     innerCacheStore,
     startTime,
-    errors,
-    timer
+    errors
   )
 
   // Return the stream as we're creating it. This means that if it ends up
@@ -894,10 +874,6 @@ export function cache(
           )
 
           if (newStream === null) {
-            if (cacheSignal) {
-              cacheSignal.endRead()
-            }
-
             // TODO: This is actually a hanging promise. Make this clearer by
             // not returning a tuple from generateCacheEntry.
             return pendingCacheEntry
