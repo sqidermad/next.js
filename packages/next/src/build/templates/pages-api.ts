@@ -4,7 +4,6 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { RouteKind } from '../../server/route-kind'
 import { sendError } from '../../server/api-utils'
 import { PagesAPIRouteModule } from '../../server/route-modules/pages-api/module.compiled'
-import fs from 'node:fs'
 import path from 'node:path'
 import { parse } from 'node:url'
 
@@ -31,6 +30,7 @@ import {
 import { removePathPrefix } from '../../shared/lib/router/utils/remove-path-prefix'
 import { normalizeLocalePath } from '../../shared/lib/i18n/normalize-locale-path'
 import type { PrerenderManifest, RoutesManifest } from '..'
+import { loadManifest } from '../../server/load-manifest.external'
 
 // Re-export the handler (should be the default export).
 export default hoist(userland, 'default')
@@ -51,19 +51,6 @@ const routeModule = new PagesAPIRouteModule({
   userland,
 })
 
-const loadedManifests = new Map<string, any>()
-
-async function loadManifest(key: string, loader: () => Promise<any>) {
-  const cached = loadedManifests.get(key)
-
-  if (cached) {
-    return cached
-  }
-  const currentManifest = await loader()
-  loadedManifests.set(key, currentManifest)
-  return currentManifest
-}
-
 export async function handler(
   req: IncomingMessage,
   res: ServerResponse,
@@ -75,26 +62,13 @@ export async function handler(
     routerServerGlobal[RouterServerContextSymbol]?.dir || process.cwd()
   const distDir = process.env.__NEXT_RELATIVE_DIST_DIR || ''
   const isDev = process.env.NODE_ENV === 'development'
+  const absoluteDistDir = path.join(dir, distDir)
 
-  const routesManifest: RoutesManifest = await loadManifest(
-    ROUTES_MANIFEST,
-    async () =>
-      JSON.parse(
-        await fs.promises.readFile(
-          path.join(dir, distDir, ROUTES_MANIFEST),
-          'utf8'
-        )
-      )
+  const routesManifest = await loadManifest<RoutesManifest>(
+    path.join(absoluteDistDir, ROUTES_MANIFEST)
   )
-  const prerenderManifest: PrerenderManifest = await loadManifest(
-    PRERENDER_MANIFEST,
-    async () =>
-      JSON.parse(
-        await fs.promises.readFile(
-          path.join(dir, distDir, PRERENDER_MANIFEST),
-          'utf8'
-        )
-      )
+  const prerenderManifest = await loadManifest<PrerenderManifest>(
+    path.join(absoluteDistDir, PRERENDER_MANIFEST)
   )
   let srcPage = 'VAR_DEFINITION_PAGE'
 
@@ -131,13 +105,8 @@ export async function handler(
     page: srcPage,
     i18n,
     basePath,
-    rewrites: Array.isArray(rewrites)
-      ? { beforeFiles: [], afterFiles: rewrites, fallback: [] }
-      : rewrites || {
-          beforeFiles: [],
-          afterFiles: [],
-          fallback: [],
-        },
+    // @ts-ignore slightly different but share needed fields
+    rewrites: rewrites || {},
     pageIsDynamic,
     trailingSlash: process.env.__NEXT_TRAILING_SLASH as any as boolean,
     caseSensitive: Boolean(routesManifest.caseSensitive),
@@ -171,7 +140,6 @@ export async function handler(
 
   // ensure instrumentation is registered and pass
   // onRequestError below
-  const absoluteDistDir = path.join(dir, distDir)
   await ensureInstrumentationRegistered(absoluteDistDir)
 
   try {
